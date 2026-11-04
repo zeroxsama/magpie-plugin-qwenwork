@@ -51,6 +51,11 @@ try {
 
   let auth
   let rejectRefresh = false
+  let accountCtx = { data: {
+    user: { id: 'fixture-user', name: 'Fixture', email: '' },
+    plan: { name: 'Fixture Plan', next_refresh_date: '2026-11-01T00:00:00Z' },
+    quota: { total: 2000, used: 17.8348, remaining: 1982.1652, exceeded: false },
+  } }
   // how the mock's agent_chat answers: a list of SSE bodies, one per call
   const agentReplies = []
   const sse = (delta, finish = null) => `data: ${JSON.stringify({ statusCodeValue: 200, body: JSON.stringify({ choices: [{ delta, finish_reason: finish }] }) })}\n\n`
@@ -64,11 +69,7 @@ try {
           assert.ok(url.searchParams.get('verifier'))
           return Response.json({ token: 'fake-device', refresh_token: 'fake-device-refresh', user_id: 'fixture-user', expires_in: 3600 })
         case '/api/v1/adapter/user/account-context':
-          return Response.json({ data: {
-            user: { id: 'fixture-user', name: 'Fixture', email: '' },
-            plan: { name: 'Fixture Plan', next_refresh_date: '2026-11-01T00:00:00Z' },
-            quota: { total: 2000, used: 17.8348, remaining: 1982.1652, exceeded: false },
-          } })
+          return Response.json(accountCtx)
         case '/api/v1/deviceToken/refresh':
           assert.equal(body.target, 'c')
           if (rejectRefresh) return Response.json({ error: 'expired' }, { status: 401 })
@@ -125,6 +126,33 @@ try {
   const usageGone = await plugin.auth.usage(async () => ({ ...auth, expires: Date.now() - 1 }))
   assert.equal(usageGone.signIn, 'expired')
   checks.push('Usage reports the account\'s credits and plan')
+  // A real account may report its allowance the way the shared Qoder
+  // adapter reads it (qoderUsage.userQuota), not as a flat quota object.
+  accountCtx = { data: {
+    displayMode: 'qoder',
+    qoderUsage: { userType: 'Pro', userQuota: { total: 2000, used: 50, remaining: 1950, name: 'Credits', unit: 'credits' } },
+  } }
+  const qoderUsage = await plugin.auth.usage(async () => auth)
+  assert.equal(qoderUsage.signIn, 'kept')
+  assert.equal(qoderUsage.plan, 'Pro')
+  assert.deepEqual(qoderUsage.windows, [{ name: 'Credits', used: 2.5, display: '50 / 2000 credits' }])
+  checks.push('Usage reads a Qoder-shaped account quota')
+
+  // An account with no allowance still reports what the endpoint returned,
+  // by key name only, so the cause is diagnosable without leaking values.
+  accountCtx = { data: { user: { id: 'fixture-user', name: 'Fixture', email: '' }, plan: { name: 'Free' } } }
+  const noQuota = await plugin.auth.usage(async () => auth)
+  assert.equal(noQuota.signIn, 'kept')
+  assert.match(noQuota.error, /no credits/)
+  assert.match(noQuota.error, /user, plan/)
+  assert.ok(!noQuota.error.includes('Fixture'), 'diagnostic names keys, never their values')
+  checks.push('Usage reports a missing allowance with diagnosable keys')
+
+  accountCtx = { data: {
+    user: { id: 'fixture-user', name: 'Fixture', email: '' },
+    plan: { name: 'Fixture Plan', next_refresh_date: '2026-11-01T00:00:00Z' },
+    quota: { total: 2000, used: 17.8348, remaining: 1982.1652, exceeded: false },
+  } }
 
   const loader = await plugin.auth.loader(async () => auth)
   const chat = (over = {}) => ({ model: 'fixture-model', messages: [{ role: 'user', content: 'fixture prompt' }], ...over })

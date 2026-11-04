@@ -49,21 +49,30 @@ function qwenworkUsage(openapi) {
       })
       if (res.status === 401 || res.status === 403) return { error: 'QwenWork: the sign-in lapsed — sign in again', signIn: 'expired' }
       if (!res.ok) return { error: `QwenWork: usage read failed (HTTP ${res.status})`, signIn }
-      const ctx = (await res.json())?.data ?? {}
-      const q = ctx.quota
+      const body = await res.json()
+      const ctx = body?.data ?? {}
+      const q = ctx.qoderUsage ?? ctx.usage ?? ctx
+      const keys = (v) => v && typeof v === 'object' ? Object.keys(v).join(', ') : (v === undefined || v === null ? 'none' : typeof v)
+      // the same allowance the Qoder adapter reads: userQuota / user_quota,
+      // else the flat quota {total, used, remaining} the older client gave
+      const bucket = q.userQuota ?? q.user_quota ?? q.quota ?? (q.total !== undefined || q.used !== undefined || q.remaining !== undefined ? q : null)
       const out = { signIn }
-      if (ctx.plan?.name) out.plan = String(ctx.plan.name)
-      const refresh = ctx.plan?.next_refresh_date ?? ctx.plan?.next_due_date
-      if (refresh) out.until = new Date(refresh).toISOString()
-      if (q && typeof q === 'object') {
-        const total = Number(q.total)
-        const remaining = Number(q.remaining)
-        const used = Number.isFinite(Number(q.used)) ? Number(q.used) : total - remaining
+      const plan = q.userType ?? q.user_type ?? ctx.plan?.name
+      if (plan) out.plan = String(plan)
+      const due = q.expiresAt ?? q.expires_at
+        ?? ctx.plan?.next_refresh_date ?? ctx.plan?.next_due_date
+      if (due) {
+        const t = typeof due === 'string' && !/^\d+$/.test(due) ? Date.parse(due) : Number(due) * (Number(due) < 1e12 ? 1000 : 1)
+        if (Number.isFinite(t)) out.until = new Date(t).toISOString()
+      }
+      if (bucket && typeof bucket === 'object') {
+        const total = Number(bucket.total ?? bucket.cap ?? 0)
+        const used = Number.isFinite(Number(bucket.used)) ? Number(bucket.used) : total - Number(bucket.remaining)
         if (Number.isFinite(total) && total > 0 && Number.isFinite(used) && used >= 0) {
-          out.windows = [{ name: 'Credits', used: Math.min(100, (100 * used) / total), display: `${num(used)} / ${num(total)} credits` }]
+          out.windows = [{ name: bucket.name ?? 'Credits', used: Math.min(100, (100 * used) / total), display: `${num(used)} / ${num(total)} ${bucket.unit ?? 'credits'}` }]
         }
       }
-      if (!out.windows) out.error = 'QwenWork: the account reports no credits'
+      if (!out.windows) out.error = `QwenWork: the account reports no credits (data: ${keys(ctx)}, account: ${keys(q)})`
       return out
     } catch (e) {
       return { error: String(e?.message ?? e), signIn }
