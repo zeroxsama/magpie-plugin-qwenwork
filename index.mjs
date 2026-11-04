@@ -32,11 +32,70 @@ const num = (v) => {
   return String(Math.round(n * 100) / 100)
 }
 
+// A finite number, even when the vendor wrote it as a string ("2000").
+const figure = (v) => {
+  if (v === undefined || v === null || v === '' || typeof v === 'boolean') return undefined
+  const n = Number(v)
+  return Number.isFinite(n) ? n : undefined
+}
+
+// The vendor has written the pool's total / used / remaining under several
+// names. Pick the first finite one from a bucket, in that order.
+const pick = (b, names) => {
+  for (const k of names) {
+    const n = figure(b?.[k])
+    if (n !== undefined) return n
+  }
+  return undefined
+}
+const TOTAL = ['total', 'cap', 'totalCredit', 'total_credit', 'totalQuota', 'total_quota', 'quota', 'amount']
+const USED = ['used', 'usedCredit', 'used_credit', 'usedQuota', 'used_quota', 'usage', 'spent']
+const LEFT = ['remaining', 'remainingCredit', 'remaining_credit', 'remainingQuota', 'remaining_quota', 'balance', 'left', 'available']
+
+// creditPool turns one object into a magpie window when it names a total and
+// either a used count or a remaining count. Strings and camel-case aliases
+// are as valid as plain numbers.
+function creditPool(b, fallback = 'Credits') {
+  if (!b || typeof b !== 'object' || Array.isArray(b)) return undefined
+  const total = pick(b, TOTAL)
+  const used = pick(b, USED)
+  const left = pick(b, LEFT)
+  if (total === undefined || total <= 0) return undefined
+  const spent = used !== undefined ? used : (left !== undefined ? total - left : undefined)
+  if (spent === undefined || spent < 0) return undefined
+  return { name: b.name ?? b.displayName ?? fallback, used: Math.min(100, (100 * spent) / total), display: `${num(spent)} / ${num(total)} ${b.unit ?? 'credits'}` }
+}
+
+// findPools walks the account-context looking for objects that look like a
+// credit pool. A plan has one pool (quota), but the allowance may sit under
+// qoderUsage.userQuota, under a nested summary, or be a list of pools; the
+// walk finds whichever the account actually returns. Depth is bounded.
+function findPools(v, depth = 0, seen = new Set()) {
+  if (depth > 6 || v === null || typeof v !== 'object' || seen.has(v)) return []
+  seen.add(v)
+  if (Array.isArray(v)) return v.flatMap(x => findPools(x, depth + 1, seen))
+  const own = creditPool(v)
+  if (own) return [own]
+  const pools = []
+  for (const k of Object.keys(v)) {
+    // quota / qoderUsage / usage / a pool's own object all get walked; a
+    // plan's refresh date is not a number and is skipped by creditPool.
+    pools.push(...findPools(v[k], depth + 1, seen))
+  }
+  return pools
+}
+
+// shape names a value's keys and types without echoing any value, so a quota
+// the parser does not recognise can still be reported and identified.
+const shape = (v) => {
+  if (Array.isArray(v)) return `[${v.length}]`
+  if (!v || typeof v !== 'object') return v === undefined || v === null ? 'none' : typeof v
+  return Object.keys(v).map(k => `${k}:${Array.isArray(v[k]) ? 'array' : v[k] && typeof v[k] === 'object' ? 'object' : typeof v[k]}`).join(', ') || '(empty)'
+}
+
 // qwenworkUsage reads the account's credits for magpie's usage bar. The
-// account-context the sign-in already uses carries them: quota {total, used,
-// remaining, exceeded} in the plan's credit unit, and plan {name, next_refresh
-// / next_due}. One window is one pool of credits; when the plan refreshes, that
-// time is the window's reset.
+// account-context the sign-in already uses carries them: a quota pool of
+// total / used / remaining credits, plus the plan's name and refresh time.
 function qwenworkUsage(openapi) {
   return async (getAuth) => {
     let signIn = 'kept'
@@ -49,30 +108,20 @@ function qwenworkUsage(openapi) {
       })
       if (res.status === 401 || res.status === 403) return { error: 'QwenWork: the sign-in lapsed — sign in again', signIn: 'expired' }
       if (!res.ok) return { error: `QwenWork: usage read failed (HTTP ${res.status})`, signIn }
-      const body = await res.json()
-      const ctx = body?.data ?? {}
-      const q = ctx.qoderUsage ?? ctx.usage ?? ctx
-      const keys = (v) => v && typeof v === 'object' ? Object.keys(v).join(', ') : (v === undefined || v === null ? 'none' : typeof v)
-      // the same allowance the Qoder adapter reads: userQuota / user_quota,
-      // else the flat quota {total, used, remaining} the older client gave
-      const bucket = q.userQuota ?? q.user_quota ?? q.quota ?? (q.total !== undefined || q.used !== undefined || q.remaining !== undefined ? q : null)
+      const ctx = (await res.json())?.data ?? {}
+      const account = ctx.qoderUsage ?? ctx.usage ?? ctx
       const out = { signIn }
-      const plan = q.userType ?? q.user_type ?? ctx.plan?.name
+      const plan = account.userType ?? account.user_type ?? ctx.plan?.name
       if (plan) out.plan = String(plan)
-      const due = q.expiresAt ?? q.expires_at
-        ?? ctx.plan?.next_refresh_date ?? ctx.plan?.next_due_date
+      const due = account.expiresAt ?? account.expires_at ?? ctx.plan?.next_refresh_date ?? ctx.plan?.next_due_date
       if (due) {
-        const t = typeof due === 'string' && !/^\d+$/.test(due) ? Date.parse(due) : Number(due) * (Number(due) < 1e12 ? 1000 : 1)
+        const t = typeof due === 'string' && !/^\d+$/.test(due) ? Date.parse(due) : figure(due) * Number(figure(due) < 1e12 ? 1000 : 1)
         if (Number.isFinite(t)) out.until = new Date(t).toISOString()
       }
-      if (bucket && typeof bucket === 'object') {
-        const total = Number(bucket.total ?? bucket.cap ?? 0)
-        const used = Number.isFinite(Number(bucket.used)) ? Number(bucket.used) : total - Number(bucket.remaining)
-        if (Number.isFinite(total) && total > 0 && Number.isFinite(used) && used >= 0) {
-          out.windows = [{ name: bucket.name ?? 'Credits', used: Math.min(100, (100 * used) / total), display: `${num(used)} / ${num(total)} ${bucket.unit ?? 'credits'}` }]
-        }
-      }
-      if (!out.windows) out.error = `QwenWork: the account reports no credits (data: ${keys(ctx)}, account: ${keys(q)})`
+      const windows = findPools(account)
+      const quotaNode = account.quota ?? account.userQuota ?? account.user_quota ?? (ctx.quota ?? undefined)
+      if (windows.length) out.windows = windows
+      else out.error = `QwenWork: the account reports no credits (data: ${shape(ctx)}, quota: ${shape(quotaNode)})`
       return out
     } catch (e) {
       return { error: String(e?.message ?? e), signIn }

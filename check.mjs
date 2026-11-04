@@ -137,15 +137,40 @@ try {
   assert.equal(qoderUsage.plan, 'Pro')
   assert.deepEqual(qoderUsage.windows, [{ name: 'Credits', used: 2.5, display: '50 / 2000 credits' }])
   checks.push('Usage reads a Qoder-shaped account quota')
+  // A quota whose numbers are strings and whose fields use the vendor's
+  // camel-case aliases still counts as an allowance.
+  accountCtx = { data: { plan: { name: 'Pro' }, quota: { totalCredit: '2000', usedCredit: '25', remainingCredit: '1975', unit: 'credits' } } }
+  const aliases = await plugin.auth.usage(async () => auth)
+  assert.equal(aliases.signIn, 'kept')
+  assert.deepEqual(aliases.windows, [{ name: 'Credits', used: 1.25, display: '25 / 2000 credits' }])
 
-  // An account with no allowance still reports what the endpoint returned,
-  // by key name only, so the cause is diagnosable without leaking values.
+  // The allowance can be nested a level down, or be a list of pools.
+  accountCtx = { data: { plan: { name: 'Pro' }, quota: { summary: { total: 100, used: 10 } } } }
+  const nested = await plugin.auth.usage(async () => auth)
+  assert.deepEqual(nested.windows, [{ name: 'Credits', used: 10, display: '10 / 100 credits' }])
+  accountCtx = { data: { plan: { name: 'Pro' }, quota: [{ total: 100, used: 0, name: 'Base' }] } }
+  const listed = await plugin.auth.usage(async () => auth)
+  assert.deepEqual(listed.windows, [{ name: 'Base', used: 0, display: '0 / 100 credits' }])
+  checks.push('Usage reads aliased, string, nested and listed quota pools')
+
+  // When no pool parses, the diagnostic names the quota's shape (keys and
+  // types), never its values, so the real fields can be identified.
+  accountCtx = { data: { plan: { name: 'Pro' }, quota: { ceiling: 2000, burned: 10 } } }
+  const opaque = await plugin.auth.usage(async () => auth)
+  assert.match(opaque.error, /no credits/)
+  assert.match(opaque.error, /ceiling:number, burned:number/)
+  assert.ok(!opaque.error.includes('2000') && !opaque.error.includes('Pro'), 'shape names keys and types, never values')
+  checks.push('A missing allowance reports the quota shape without leaking values')
+
+
+  // An account with no quota at all reports the shape it did return, by key
+  // name only, so the cause is diagnosable without leaking values.
   accountCtx = { data: { user: { id: 'fixture-user', name: 'Fixture', email: '' }, plan: { name: 'Free' } } }
   const noQuota = await plugin.auth.usage(async () => auth)
   assert.equal(noQuota.signIn, 'kept')
   assert.match(noQuota.error, /no credits/)
-  assert.match(noQuota.error, /user, plan/)
-  assert.ok(!noQuota.error.includes('Fixture'), 'diagnostic names keys, never their values')
+  assert.match(noQuota.error, /quota: none/)
+  assert.ok(!noQuota.error.includes('Fixture') && !noQuota.error.includes('Free'), 'diagnostic names keys, never their values')
   checks.push('Usage reports a missing allowance with diagnosable keys')
 
   accountCtx = { data: {
