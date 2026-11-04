@@ -152,6 +152,14 @@ try {
   const listed = await plugin.auth.usage(async () => auth)
   assert.deepEqual(listed.windows, [{ name: 'Base', used: 0, display: '0 / 100 credits' }])
   checks.push('Usage reads aliased, string, nested and listed quota pools')
+  // The real account wraps total and used in amount objects
+  // ({value, unit}) while remaining stays a plain number: read through them.
+  accountCtx = { data: { plan: { name: 'Pro' }, quota: { total: { value: 2000, unit: 'credits' }, used: { value: 50 }, remaining: 1950, exceeded: false } } }
+  const wrapped = await plugin.auth.usage(async () => auth)
+  assert.equal(wrapped.signIn, 'kept')
+  assert.deepEqual(wrapped.windows, [{ name: 'Credits', used: 2.5, display: '50 / 2000 credits' }])
+  checks.push('Usage reads quota totals wrapped in amount objects')
+
 
   // When no pool parses, the diagnostic names the quota's shape (keys and
   // types), never its values, so the real fields can be identified.

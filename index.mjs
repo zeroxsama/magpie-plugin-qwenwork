@@ -32,9 +32,17 @@ const num = (v) => {
   return String(Math.round(n * 100) / 100)
 }
 
-// A finite number, even when the vendor wrote it as a string ("2000").
+// A finite number, even when the vendor wrote it as a string ("2000") or
+// wrapped it in an amount object ({value: 2000, unit: "credits"}), which is
+// how QwenWork's account-context actually returns quota.total / quota.used.
+const AMOUNT_KEYS = ['value', 'amount', 'num', 'count', 'total', 'used', 'remaining', 'credit', 'credits', 'quota', 'number']
 const figure = (v) => {
   if (v === undefined || v === null || v === '' || typeof v === 'boolean') return undefined
+  if (typeof v === 'object' && !Array.isArray(v)) {
+    for (const k of AMOUNT_KEYS) if (k in v) { const n = figure(v[k]); if (n !== undefined) return n }
+    for (const k of Object.keys(v)) { const n = figure(v[k]); if (n !== undefined) return n }
+    return undefined
+  }
   const n = Number(v)
   return Number.isFinite(n) ? n : undefined
 }
@@ -86,11 +94,14 @@ function findPools(v, depth = 0, seen = new Set()) {
 }
 
 // shape names a value's keys and types without echoing any value, so a quota
-// the parser does not recognise can still be reported and identified.
-const shape = (v) => {
+// the parser does not recognise can still be reported and identified. Nested
+// amount objects are expanded (bounded depth), never their values.
+const shape = (v, depth = 0) => {
+  if (v === undefined || v === null) return 'none'
   if (Array.isArray(v)) return `[${v.length}]`
-  if (!v || typeof v !== 'object') return v === undefined || v === null ? 'none' : typeof v
-  return Object.keys(v).map(k => `${k}:${Array.isArray(v[k]) ? 'array' : v[k] && typeof v[k] === 'object' ? 'object' : typeof v[k]}`).join(', ') || '(empty)'
+  if (typeof v !== 'object') return typeof v
+  if (depth > 3) return 'object'
+  return Object.keys(v).map(k => `${k}:${shape(v[k], depth + 1)}`).join(', ') || '(empty)'
 }
 
 // qwenworkUsage reads the account's credits for magpie's usage bar. The
