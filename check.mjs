@@ -53,8 +53,8 @@ try {
   let rejectRefresh = false
   let accountCtx = { data: {
     user: { id: 'fixture-user', name: 'Fixture', email: '' },
-    plan: { name: 'Fixture Plan', next_refresh_date: '2026-11-01T00:00:00Z' },
-    quota: { total: 2000, used: 17.8348, remaining: 1982.1652, exceeded: false },
+    plan: { name: 'Fixture Plan', next_due_date: '2026-11-01T00:00:00Z', next_refresh_date: null },
+    quota: { total: null, used: null, remaining: 1982.1652, exceeded: false },
   } }
   // how the mock's agent_chat answers: a list of SSE bodies, one per call
   const agentReplies = []
@@ -122,69 +122,35 @@ try {
   assert.equal(usage.signIn, 'kept')
   assert.equal(usage.plan, 'Fixture Plan')
   assert.equal(usage.until, '2026-11-01T00:00:00.000Z')
-  assert.deepEqual(usage.windows, [{ name: 'Credits', used: (100 * 17.8348) / 2000, display: '17.83 / 2000 credits' }])
+  assert.deepEqual(usage.windows, [{ name: 'Credits', balance: 1982.1652, display: '1982.17 credits left', unit: 'credits' }])
   const usageGone = await plugin.auth.usage(async () => ({ ...auth, expires: Date.now() - 1 }))
   assert.equal(usageGone.signIn, 'expired')
-  checks.push('Usage reports the account\'s credits and plan')
-  // A real account may report its allowance the way the shared Qoder
-  // adapter reads it (qoderUsage.userQuota), not as a flat quota object.
-  accountCtx = { data: {
-    displayMode: 'qoder',
-    qoderUsage: { userType: 'Pro', userQuota: { total: 2000, used: 50, remaining: 1950, name: 'Credits', unit: 'credits' } },
-  } }
-  const qoderUsage = await plugin.auth.usage(async () => auth)
-  assert.equal(qoderUsage.signIn, 'kept')
-  assert.equal(qoderUsage.plan, 'Pro')
-  assert.deepEqual(qoderUsage.windows, [{ name: 'Credits', used: 2.5, display: '50 / 2000 credits' }])
-  checks.push('Usage reads a Qoder-shaped account quota')
-  // A quota whose numbers are strings and whose fields use the vendor's
-  // camel-case aliases still counts as an allowance.
-  accountCtx = { data: { plan: { name: 'Pro' }, quota: { totalCredit: '2000', usedCredit: '25', remainingCredit: '1975', unit: 'credits' } } }
-  const aliases = await plugin.auth.usage(async () => auth)
-  assert.equal(aliases.signIn, 'kept')
-  assert.deepEqual(aliases.windows, [{ name: 'Credits', used: 1.25, display: '25 / 2000 credits' }])
+  checks.push('Usage reports the remaining credits and plan')
 
-  // The allowance can be nested a level down, or be a list of pools.
-  accountCtx = { data: { plan: { name: 'Pro' }, quota: { summary: { total: 100, used: 10 } } } }
-  const nested = await plugin.auth.usage(async () => auth)
-  assert.deepEqual(nested.windows, [{ name: 'Credits', used: 10, display: '10 / 100 credits' }])
-  accountCtx = { data: { plan: { name: 'Pro' }, quota: [{ total: 100, used: 0, name: 'Base' }] } }
-  const listed = await plugin.auth.usage(async () => auth)
-  assert.deepEqual(listed.windows, [{ name: 'Base', used: 0, display: '0 / 100 credits' }])
-  checks.push('Usage reads aliased, string, nested and listed quota pools')
-  // The real account wraps total and used in amount objects
-  // ({value, unit}) while remaining stays a plain number: read through them.
-  accountCtx = { data: { plan: { name: 'Pro' }, quota: { total: { value: 2000, unit: 'credits' }, used: { value: 50 }, remaining: 1950, exceeded: false } } }
-  const wrapped = await plugin.auth.usage(async () => auth)
-  assert.equal(wrapped.signIn, 'kept')
-  assert.deepEqual(wrapped.windows, [{ name: 'Credits', used: 2.5, display: '50 / 2000 credits' }])
-  checks.push('Usage reads quota totals wrapped in amount objects')
+  // A plan that does give total and used still reports a used/limit window.
+  accountCtx = { data: { plan: { name: 'Pro' }, quota: { total: 2000, used: 50, remaining: 1950, exceeded: false } } }
+  const withTotal = await plugin.auth.usage(async () => auth)
+  assert.deepEqual(withTotal.windows, [{ name: 'Credits', used: 2.5, display: '50 / 2000 credits' }])
+  checks.push('Usage reports a used/limit window when the plan gives total')
 
+  // An exhausted plan (remaining 0, exceeded true) is still a real reading.
+  accountCtx = { data: { plan: { name: 'Pro' }, quota: { total: null, used: null, remaining: 0, exceeded: true } } }
+  const exhausted = await plugin.auth.usage(async () => auth)
+  assert.deepEqual(exhausted.windows, [{ name: 'Credits', balance: 0, display: '0 credits left', unit: 'credits' }])
+  checks.push('Usage reports an exhausted plan as zero remaining')
 
-  // When no pool parses, the diagnostic names the quota's shape (keys and
-  // types), never its values, so the real fields can be identified.
-  accountCtx = { data: { plan: { name: 'Pro' }, quota: { ceiling: 2000, burned: 10 } } }
+  // No remaining figure at all: report the shape, without echoing values.
+  accountCtx = { data: { plan: { name: 'Pro' }, quota: { total: null, used: null, remaining: null, exceeded: false } } }
   const opaque = await plugin.auth.usage(async () => auth)
   assert.match(opaque.error, /no credits/)
-  assert.match(opaque.error, /ceiling:number, burned:number/)
-  assert.ok(!opaque.error.includes('2000') && !opaque.error.includes('Pro'), 'shape names keys and types, never values')
-  checks.push('A missing allowance reports the quota shape without leaking values')
-
-
-  // An account with no quota at all reports the shape it did return, by key
-  // name only, so the cause is diagnosable without leaking values.
-  accountCtx = { data: { user: { id: 'fixture-user', name: 'Fixture', email: '' }, plan: { name: 'Free' } } }
-  const noQuota = await plugin.auth.usage(async () => auth)
-  assert.equal(noQuota.signIn, 'kept')
-  assert.match(noQuota.error, /no credits/)
-  assert.match(noQuota.error, /quota: none/)
-  assert.ok(!noQuota.error.includes('Fixture') && !noQuota.error.includes('Free'), 'diagnostic names keys, never their values')
-  checks.push('Usage reports a missing allowance with diagnosable keys')
+  assert.match(opaque.error, /remaining:none/)
+  assert.ok(!opaque.error.includes('Pro'), 'shape names keys and types, never values')
+  checks.push('A quota without a remaining count is reported diagnosably')
 
   accountCtx = { data: {
     user: { id: 'fixture-user', name: 'Fixture', email: '' },
-    plan: { name: 'Fixture Plan', next_refresh_date: '2026-11-01T00:00:00Z' },
-    quota: { total: 2000, used: 17.8348, remaining: 1982.1652, exceeded: false },
+    plan: { name: 'Fixture Plan', next_due_date: '2026-11-01T00:00:00Z', next_refresh_date: null },
+    quota: { total: null, used: null, remaining: 1982.1652, exceeded: false },
   } }
 
   const loader = await plugin.auth.loader(async () => auth)
