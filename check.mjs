@@ -127,9 +127,21 @@ try {
   assert.equal(usage.plan, 'Fixture Plan')
   assert.equal(usage.until, '2026-11-01T00:00:00.000Z')
   assert.deepEqual(usage.windows, [{ name: 'Credits', balance: 1982.1652, display: '1982.17 credits left (daily 100 · monthly 1500.5 · long-term 381.67)', unit: 'credits' }])
+  assert.equal(usage.balance, '1982.17 credits (daily 100 · monthly 1500.5 · long-term 381.67)', 'the card balance string is set too')
   const usageGone = await plugin.auth.usage(async () => ({ ...auth, expires: Date.now() - 1 }))
   assert.equal(usageGone.signIn, 'expired')
   checks.push('Usage reports the remaining credits and plan')
+
+  // A quota whose counts come wrapped in amount objects still reads.
+  accountCtx = { data: { plan: { name: 'Pro' }, quota: { total: null, used: null, remaining: { amount: 42.5 }, exceeded: false } } }
+  const wrapped = await plugin.auth.usage(async () => auth)
+  assert.equal(wrapped.windows[0].balance, 42.5)
+  accountCtx = { data: {
+    user: { id: 'fixture-user', name: 'Fixture', email: '' },
+    plan: { name: 'Fixture Plan', next_due_date: '2026-11-01T00:00:00Z', next_refresh_date: null },
+    quota: { total: null, used: null, remaining: 1982.1652, exceeded: false },
+  } }
+  checks.push('Usage reads counts wrapped in amount objects')
 
   // A plan that does give total and used still reports a used/limit window.
   accountCtx = { data: { plan: { name: 'Pro' }, quota: { total: 2000, used: 50, remaining: 1950, exceeded: false } } }
@@ -231,6 +243,24 @@ try {
   assert.ok(!JSON.stringify(toolTurn).includes('cache_control'), 'nothing marked when the last turn is a tool\'s')
   checks.push('Prompt-cache marking, stable session and one task per tool loop ride along')
 
+  // A history whose assistant tool call lost its id goes out with the same
+  // made id on every request: a random one changed the prompt's prefix and
+  // the gateway's cache never hit.
+  const noIdMsgs = [
+    { role: 'user', content: 'fixture prompt' },
+    { role: 'assistant', content: '', tool_calls: [{ type: 'function', function: { name: 'lookup', arguments: '{"q":"x"}' } }] },
+    { role: 'tool', tool_call_id: 'call_lost', content: 'the result' },
+    { role: 'user', content: 'and then?' },
+  ]
+  agentReplies.push([sse({ role: 'assistant', content: 'x' }), sse({}, 'stop'), 'data: {"body":"[DONE]"}\n\n'].join(''))
+  await loader.fetch(values.API + '/chat/completions', { body: JSON.stringify(chat({ tools, messages: noIdMsgs })) })
+  agentReplies.push([sse({ role: 'assistant', content: 'y' }), sse({}, 'stop'), 'data: {"body":"[DONE]"}\n\n'].join(''))
+  await loader.fetch(values.API + '/chat/completions', { body: JSON.stringify(chat({ tools, messages: noIdMsgs })) })
+  const idOf = (b) => b.messages.find(m => m.role === 'assistant' && m.tool_calls)?.tool_calls[0].id
+  assert.ok(idOf(agentChats.at(-2)).startsWith('call_'))
+  assert.equal(idOf(agentChats.at(-2)), idOf(agentChats.at(-1)), 'the made id is the same on every request')
+  checks.push('A tool call without an id keeps one made id across requests')
+
   // The chat.headers hook names the session magpie gives, and the loader's
   // fetch reads it back: two prompts of one named session keep its id.
   const headersOut = { headers: {} }
@@ -244,8 +274,8 @@ try {
   await loader.fetch(values.API + '/chat/completions', { headers: { 'x-magpie-qwenwork-session': sessionHeader }, body: JSON.stringify(chat({ messages: [{ role: 'user', content: 'first prompt of the named session' }] })) })
   agentReplies.push([sse({ role: 'assistant', content: 'b' }), sse({}, 'stop'), 'data: {"body":"[DONE]"}\n\n'].join(''))
   await loader.fetch(values.API + '/chat/completions', { headers: { 'x-magpie-qwenwork-session': sessionHeader }, body: JSON.stringify(chat({ messages: [{ role: 'user', content: 'second prompt of the named session' }] })) })
-  assert.equal(agentChats[4].session_id, agentChats[5].session_id, 'the named session holds across prompts')
-  assert.notEqual(agentChats[4].request_set_id, agentChats[5].request_set_id, 'a new prompt is a new task')
+  assert.equal(agentChats.at(-2).session_id, agentChats.at(-1).session_id, 'the named session holds across prompts')
+  assert.notEqual(agentChats.at(-2).request_set_id, agentChats.at(-1).request_set_id, 'a new prompt is a new task')
   checks.push('The named session holds across prompts; each prompt is its own task')
 
   // The usage chunk after the finish is read: tokens and the cache hit

@@ -3,7 +3,7 @@
 // the host's tools ride along, tool calls come back structured, and the
 // host agent keeps its loop. Magpie auth supplies the account; COSY signing,
 // the request codec and the endpoint stay in the adapter.
-import { createPublicKey } from 'node:crypto'
+import { createPublicKey, randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 
 const defaults = JSON.parse(readFileSync(new URL('./defaults.json', import.meta.url), 'utf8'))
@@ -32,8 +32,18 @@ const num = (v) => {
   return String(Math.round(n * 100) / 100)
 }
 
+// figure reads a credit count, plain or wrapped: QwenWork sometimes answers
+// an amount as an object ({amount, value, total_balance, …}) rather than a
+// number; the first finite field of the usual names is the count.
 const figure = (v) => {
-  if (v === undefined || v === null || v === '' || typeof v === 'boolean' || typeof v === 'object') return undefined
+  if (v !== null && typeof v === 'object' && !Array.isArray(v)) {
+    for (const k of ['amount', 'value', 'remaining', 'total_balance', 'totalBalance', 'balance', 'total', 'used']) {
+      const n = figure(v[k])
+      if (n !== undefined) return n
+    }
+    return undefined
+  }
+  if (v === undefined || v === null || v === '' || typeof v === 'boolean') return undefined
   const n = Number(v)
   return Number.isFinite(n) ? n : undefined
 }
@@ -74,6 +84,29 @@ function spentSince(left) {
   lastRemaining = left
 }
 
+// clientHeaders are the names QwenWork's own client puts on every gateway
+// call outside a chat (its openApiJsonRequest), as the upstream plugin
+// sends them: without them the call goes out as no client at all, which
+// some gateway routes refuse or answer empty.
+const clientHeaders = () => ({
+  'User-Agent': 'qoderwork/1.2.1',
+  'X-Request-Id': randomUUID(),
+  'X-QwenWork-Version': '1.2.1',
+  'X-QwenWork-Release-Version': '1.2.1-26092107',
+  'X-QwenWork-Build': '26092107',
+  'X-QwenWork-Platform': process.platform,
+  'X-QwenWork-Arch': process.arch,
+  'X-QwenWork-Channel': 'stable',
+})
+
+// usageSaid logs what a usage read gave, on stderr when
+// QWENWORK_DEBUG_USAGE=1: the quota's shape and the windows built from it,
+// so an empty balance can be told apart from a refused or empty read.
+function usageSaid(what, detail) {
+  if (process.env.QWENWORK_DEBUG_USAGE !== '1') return
+  console.error(`[qwenwork] usage ${what}: ${detail}`)
+}
+
 // qwenworkUsage reads the account's credits for magpie's usage bar from the
 // account-context the sign-in already uses. QwenWork's real response gives
 // quota {total: null, used: null, remaining, exceeded} — only the remaining
@@ -88,12 +121,13 @@ function qwenworkUsage(openapi) {
       const a = await getAuth()
       if (a?.type !== 'oauth' || !String(a.access ?? '').trim() || (a.expires > 0 && a.expires <= Date.now())) return { error: 'QwenWork: not signed in', signIn: 'expired' }
       const res = await fetch(`${openapi}/api/v1/adapter/user/account-context?include=user,plan,quota`, {
-        headers: { Accept: 'application/json', Authorization: `Bearer ${a.access}` },
+        headers: { Accept: 'application/json', ...clientHeaders(), Authorization: `Bearer ${a.access}` },
         signal: AbortSignal.timeout(20_000),
       })
       if (res.status === 401 || res.status === 403) return { error: 'QwenWork: the sign-in lapsed — sign in again', signIn: 'expired' }
       if (!res.ok) return { error: `QwenWork: usage read failed (HTTP ${res.status})`, signIn }
-      const ctx = (await res.json())?.data ?? {}
+      const env = await res.json()
+      const ctx = env?.data && typeof env.data === 'object' ? env.data : (env ?? {})
       const q = ctx.quota ?? {}
       const out = { signIn }
       if (ctx.plan?.name) out.plan = String(ctx.plan.name)
@@ -116,16 +150,18 @@ function qwenworkUsage(openapi) {
         if (ctx.user?.is_biz !== true && ctx.user?.isBiz !== true) {
           try {
             const wres = await fetch(`${openapi}/api/v1/adapter/user/wallets`, {
-              headers: { Accept: 'application/json', Authorization: `Bearer ${a.access}` },
+              headers: { Accept: 'application/json', ...clientHeaders(), Authorization: `Bearer ${a.access}` },
               signal: AbortSignal.timeout(20_000),
             })
             if (wres.ok) pools = walletPools(await wres.json())
           } catch {}
         }
+        out.balance = `${num(left)} credits${pools.length ? ` (${pools.join(' · ')})` : ''}`
         out.windows = [{ name: 'Credits', balance: left, display: `${num(left)} credits left${pools.length ? ` (${pools.join(' · ')})` : ''}`, unit: 'credits' }]
       }
       spentSince(left)
       if (!out.windows) out.error = `QwenWork: the account reports no credits (quota: ${shape(q)})`
+      usageSaid(out.windows ? 'read' : 'EMPTY', `quota {${shape(q)}} -> ${out.windows ? JSON.stringify(out.windows) : out.error}`)
       return out
     } catch (e) {
       return { error: String(e?.message ?? e), signIn }

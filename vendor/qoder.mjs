@@ -635,11 +635,16 @@ function qoderMessages(msgs) {
       continue
     }
     if (m.role === "assistant" && m.tool_calls?.length) {
-      const calls = m.tool_calls.map((c) => {
-        const id = c.id || "call_" + hexID()
-        names[id] = c.function?.name
+      const calls = m.tool_calls.map((c, i) => {
         const args = c.function?.arguments
-        return { id, type: "function", function: { name: c.function?.name, arguments: typeof args === "string" ? args : JSON.stringify(args ?? {}) } }
+        const argText = typeof args === "string" ? args : JSON.stringify(args ?? {})
+        // a call the client sent without an id gets one made from its turn,
+        // its place and its arguments, so it goes out the same on every
+        // request: a fresh random id each time changed the prompt's prefix
+        // and the gateway's cache never hit (upstream #290's rule)
+        const id = c.id || "call_" + createHash("sha256").update(JSON.stringify([out.length, i, c.function?.name ?? "", argText])).digest("hex").slice(0, 24)
+        names[id] = c.function?.name
+        return { id, type: "function", function: { name: c.function?.name, arguments: argText } }
       })
       out.push({ role: "assistant", content: textOf(m.content), tool_calls: calls })
       continue
@@ -1451,7 +1456,12 @@ export const makePlugin = (site) => async ({ client }) => {
     }
     if (!m) return errorResponse({ status: 400, message: `unknown or disabled model "${chat.model}"` })
     const CHAT_URL = siteOf(site, cred).api + CHAT_PATH
-    const task = taskOf(sessionOf(chat, named), chat)
+    const session = sessionOf(chat, named)
+    const task = taskOf(session, chat)
+    if (process.env.QWENWORK_DEBUG_USAGE === "1") {
+      const src = named ? "named" : String(chat.prompt_cache_key ?? "").trim() ? "prompt_cache_key" : String(chat.user ?? "").trim() ? "user" : "opening-hash"
+      console.error(`[qwenwork] ${want}: session ${session.slice(0, 8)} (${src}) task ${task.id.slice(0, 8)} stage ${task.answered ? "processing" : "start"} msgs ${(chat.messages ?? []).length}`)
+    }
     const wire = encodeBody(JSON.stringify(qoderBody(chat, m, site, named, task)))
     const headers = {
       ...cosyHeaders(CHAT_URL, cred, wire, site),
@@ -1518,7 +1528,10 @@ export const makePlugin = (site) => async ({ client }) => {
           // every chat completion written as Qoder's own request
           async fetch(input, init = {}) {
             const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url
-            const named = String((init.headers instanceof Headers ? init.headers.get(SESSION) : init.headers?.[SESSION]) ?? "")
+            const named = String(
+              (init.headers instanceof Headers ? init.headers.get(SESSION) : init.headers?.[SESSION]) ??
+              (input instanceof Request ? input.headers.get(SESSION) : null) ?? "",
+            )
             if (!/\/chat\/completions$/.test(new URL(url).pathname))
               return errorResponse({ status: 404, message: "only chat completions are served" })
             let chat
