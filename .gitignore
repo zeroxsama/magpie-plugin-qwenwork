@@ -3,3 +3,4 @@ sdk-config/
 sdk-debug-*.log
 *.tmp
 verification.json
+/.idea/
