@@ -654,6 +654,98 @@ function qoderMessages(msgs) {
   return out
 }
 
+// ---- the prompt cache (ported from magpie-community/plugins qoder, #290/#330) --
+//
+// UNCACHED are the blocks the client never marks for the prompt cache.
+const UNCACHED = new Set(["thinking", "redacted_thinking", "tool_use", "tool_result"])
+
+// cacheMarked is the turns as Qoder's/QwenWork's own client sends them for
+// the prompt cache (#290): every user turn's blocks also as contents, and
+// the last block of the last turn that isn't thinking or a tool's marked
+// cache_control ephemeral — nothing when the last turn is a tool's. A
+// model behind the gateway that caches only what is marked read none of a
+// conversation without it. The caller's turns are left as they were.
+function cacheMarked(msgs) {
+  const out = msgs.map((m) => (m.role === "user" && Array.isArray(m.content) ? { ...m, contents: m.content } : m))
+  const last = out.at(-1)
+  if (last?.role !== "user" || !Array.isArray(last.content)) return out
+  const at = last.content.findLastIndex((b) => b?.type && !UNCACHED.has(b.type))
+  if (at < 0) return out
+  const blocks = last.content.slice()
+  blocks[at] = { ...blocks[at], cache_control: { type: "ephemeral" } }
+  out[out.length - 1] = { ...last, content: blocks, contents: blocks }
+  return out
+}
+
+// sessionOf is the session_id a request goes out under: one for every turn
+// of a conversation and another for each conversation (#290). The gateway
+// can keep a conversation where its prompt is cached only when its turns
+// say they are one. It is the session the agent named (named: the
+// chat.headers hook's, #330), else the client's prompt_cache_key (Codex's
+// thread), else its user, else the conversation's opening (its system
+// prompt and first user turn), hashed, so no key of the client's goes out
+// as it is.
+function sessionOf(chat, named = "") {
+  let seed = named ? "session\0" + named : String(chat.prompt_cache_key ?? "").trim() ? "key\0" + chat.prompt_cache_key : String(chat.user ?? "").trim() ? "user\0" + chat.user : ""
+  if (!seed) {
+    const msgs = chat.messages ?? []
+    const sys = msgs.filter((x) => x.role === "system" || x.role === "developer").map((x) => textOf(x.content))
+    const first = msgs.find((x) => x.role === "user")
+    seed = "chat\0" + JSON.stringify([sys, first?.content ?? ""])
+  }
+  const h = createHash("sha256").update(seed).digest("hex")
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`
+}
+
+// SESSION carries the session magpie (or OpenCode) names a request's
+// conversation by, from the chat.headers hook to the loader's fetch. It
+// goes no further: nothing of the request's headers is sent upstream.
+const SESSION = "x-magpie-qwenwork-session"
+
+// namedSession is the session a chat.headers hook is told, "" when it
+// names none. magpie, with no session header from the agent, makes one of
+// the conversation's first user message ("magpie-" and 24 hex digits):
+// that names no session, and sessionOf's own hash is taken instead.
+function namedSession(input) {
+  const s = String(input?.sessionID ?? "").trim()
+  if (!s || /^magpie-[0-9a-f]{24}$/.test(s)) return ""
+  return s.slice(0, 128)
+}
+
+// A task is what the client sends under one request_set_id and one
+// business record (#330): every model call that answers one user prompt,
+// the tool loop's turns included. Only request_id and chat_record_id are
+// new on every call; business.id is the task's, begin_at when the prompt
+// started, stage "start" until a call is answered and "processing" after.
+// A task here is a session's last user turn: the tool loop repeats it,
+// and a new prompt is a new one. TASKS holds at most TASK_MAX of them,
+// each for TASK_IDLE after its last call.
+const TASKS = new Map()
+const TASK_MAX = 512
+const TASK_IDLE = 2 * 60 * 60 * 1000
+
+const taskName = (prompt) => (prompt.length > 10 ? prompt.slice(0, 10) : prompt)
+
+// taskOf is the task chat's call belongs to, in session sid: made on its
+// first call, the same one on every call after.
+function taskOf(sid, chat, now = Date.now()) {
+  const msgs = chat.messages ?? []
+  const at = msgs.findLastIndex((x) => x?.role === "user")
+  const key = createHash("sha256").update(JSON.stringify([sid, at, at < 0 ? null : msgs[at].content ?? null])).digest("hex")
+  for (const [k, t] of TASKS) {
+    if (now - t.used <= TASK_IDLE) break
+    TASKS.delete(k)
+  }
+  let t = TASKS.get(key)
+  if (t && now - t.used > TASK_IDLE) t = undefined
+  TASKS.delete(key)
+  t ??= { id: randomUUID(), begin: now, answered: false, name: taskName(at < 0 ? "" : textOf(msgs[at].content)) }
+  t.used = now
+  TASKS.set(key, t)
+  while (TASKS.size > TASK_MAX) TASKS.delete(TASKS.keys().next().value)
+  return t
+}
+
 // windowFor is the context window a request is sent (context_length) on a
 // model that offers several: the one Qoder's client picks by default
 // (max_input_tokens without one) while the request fits it, else the
@@ -674,8 +766,12 @@ function windowFor(chat, m, reply = 0) {
 }
 
 // qoderBody is the plaintext agent_chat_generation takes for a chat
-// completion request, for model m.
-function qoderBody(chat, m, site) {
+// completion request, for model m, in the session the agent named (named,
+// "" when none) and the task it is a call of (taskOf's, made when none is
+// given): one request_set_id and business record for the whole tool loop,
+// as the client sends them (#330) — the gateway keeps its prompt cache and
+// its billing per task, so a new record on every call lost both.
+function qoderBody(chat, m, site, named = "", task) {
   const system = (chat.messages ?? []).filter((x) => x.role === "system" || x.role === "developer").map((x) => textOf(x.content)).filter(Boolean).join("\n\n")
   const tools = chat.tool_choice !== "none" ? (chat.tools ?? []).filter((t) => t?.type === "function" && t.function?.name) : []
   const baseSystem = site?.systemPrompt ?? QODER_SYS
@@ -688,10 +784,12 @@ function qoderBody(chat, m, site) {
   const window = windowFor(chat, m, params.max_tokens)
   if (window > 0) params.context_length = window
   const requestId = hexID()
+  const session = sessionOf(chat, named)
+  task ??= taskOf(session, chat)
   const body = {
     ...(site?.modelScene === "qwork" ? {
-      request_id: requestId, request_set_id: requestId, chat_record_id: requestId,
-      session_id: chat.user || hexID(), stream: true, chat_task: "FREE_INPUT",
+      request_id: requestId, request_set_id: task.id, chat_record_id: requestId,
+      session_id: session, stream: true, chat_task: "FREE_INPUT",
       is_reply: true, is_retry: false, source: 1, version: "3", aliyun_user_type: "",
       chat_context: {
         text: textOf((chat.messages ?? []).findLast((x) => x.role === "user")?.content ?? ""),
@@ -701,7 +799,7 @@ function qoderBody(chat, m, site) {
       },
     } : {}),
     parameters: params,
-    business: { product: site?.businessProduct ?? "app", version: site?.cosyVersion ?? COSY_VERSION, type: "agent", id: hexID(), name: "magpie session", begin_at: Date.now(), stage: "start" },
+    business: { product: site?.businessProduct ?? "app", version: site?.cosyVersion ?? COSY_VERSION, type: "agent", id: task.id, name: task.name ?? "magpie session", begin_at: task.begin, stage: task.answered ? "processing" : "start" },
     agent_id: "agent_common",
     task_id: "common",
     session_type: site?.sessionType ?? "app",
@@ -711,7 +809,7 @@ function qoderBody(chat, m, site) {
       source: m.source || "system", max_input_tokens: m.config.max_input_tokens ?? 200000,
     } : m.config,
     system: [sys],
-    messages: [{ role: "system", content: [sys] }, ...qoderMessages(chat.messages ?? [])],
+    messages: [{ role: "system", content: [sys] }, ...cacheMarked(qoderMessages(chat.messages ?? []))],
   }
   if (tools.length)
     body.tools = tools.map((t) => ({
@@ -875,10 +973,37 @@ async function* sseLines(body) {
   if (buf.trim()) yield buf.trim()
 }
 
+// sseTee copies every raw SSE line to the file QWENWORK_DEBUG_SSE names,
+// append-only, when it is set: the ground truth for what the gateway
+// reports (usage, cached_tokens, credits) that the codec might drop.
+// Unset, the body passes through untouched.
+async function* sseTee(body) {
+  const path = process.env.QWENWORK_DEBUG_SSE
+  if (!path) { yield* body; return }
+  let fh
+  try { fh = await import("node:fs/promises").then((fs) => fs.open(path, "a")) } catch {}
+  try {
+    for await (const chunk of body) {
+      if (fh) await fh.write(chunk).catch(() => {})
+      yield chunk
+    }
+  } finally { await fh?.close().catch(() => {}) }
+}
+
+// usageSaid logs what a turn's usage gave — tokens in and out, cache hit,
+// reasoning — on stderr when QWENWORK_DEBUG_USAGE=1, so a run can be
+// watched without a capture.
+function usageSaid(model, usage) {
+  if (process.env.QWENWORK_DEBUG_USAGE !== "1") return
+  const c = usage?.prompt_tokens_details?.cached_tokens ?? 0
+  const hit = usage?.prompt_tokens ? Math.round((100 * c) / usage.prompt_tokens) : 0
+  console.error(`[qwenwork] ${model}: usage ${usage ? `in=${usage.prompt_tokens} out=${usage.completion_tokens} cached=${c} (${hit}%)` : "ABSENT — the gateway sent no usage chunk"}`)
+}
+
 // events turns Qoder's SSE into chat completion pieces: each data line's
 // envelope has a "body" that is an OpenAI chunk, whose content may hold
 // tool calls to lift out.
-async function* events(body) {
+async function* events(body, model = "") {
   const a = new Splitter()
   let index = -1 // the tool call being given
   let native = -1 // the native tool call being assembled
@@ -887,7 +1012,7 @@ async function* events(body) {
   }
   let usage
   let fr = ""
-  for await (const line of sseLines(body)) {
+  for await (const line of sseLines(sseTee(body))) {
     if (!line.startsWith("data:")) continue
     const payload = line.slice(5).trim()
     let env
@@ -940,16 +1065,17 @@ async function* events(body) {
       }
   }
   yield* flushed()
+  usageSaid(model, usage)
   yield { stop: a.sawTool ? "tool_calls" : fr === "length" ? "length" : "stop", usage }
 }
 
 // answer turns Qoder's reply into the chat completion OpenAI's API gives.
 // A failure before the answer keeps its status; one after it ends the
 // stream with an error.
-async function answer(res, chat) {
+async function answer(res, chat, onDone) {
   const id = "chatcmpl-" + hexID()
   const created = Math.floor(Date.now() / 1000)
-  const it = events(res.body)
+  const it = events(res.body, chat.model)
   const first = await it.next()
   if (first.value?.error) return errorResponse(first.value.error)
   if (first.done) return errorResponse({ status: 502, message: "upstream ended without an answer" })
@@ -967,7 +1093,7 @@ async function answer(res, chat) {
       if (e.reasoning) reasoning += e.reasoning
       if (e.tool) calls.push({ id: e.tool.id, type: "function", function: { name: e.tool.name, arguments: e.tool.args } })
       if (e.args) calls[calls.length - 1].function.arguments += e.args.text
-      if (e.stop) [stop, usage] = [e.stop, e.usage]
+      if (e.stop) { [stop, usage] = [e.stop, e.usage]; onDone?.() }
     }
     if (reasoning) msg.reasoning_content = reasoning
     if (calls.length) msg.tool_calls = calls
@@ -996,7 +1122,7 @@ async function answer(res, chat) {
       else if (e.reasoning) ctl.enqueue(chunk({ reasoning_content: e.reasoning }))
       else if (e.tool) ctl.enqueue(chunk({ tool_calls: [{ index: e.tool.index, id: e.tool.id, type: "function", function: { name: e.tool.name, arguments: e.tool.args } }] }))
       else if (e.args) ctl.enqueue(chunk({ tool_calls: [{ index: e.args.index, function: { arguments: e.args.text } }] }))
-      else if (e.stop) ctl.enqueue(chunk({}, e.stop, e.usage ? { usage: e.usage } : {}))
+      else if (e.stop) { ctl.enqueue(chunk({}, e.stop, e.usage ? { usage: e.usage } : {})); onDone?.() }
       else if (e.error) {
         ctl.enqueue(enc.encode(`data: ${JSON.stringify({ error: { message: e.error.message, code: e.error.status } })}\n\n`))
         ctl.close()
@@ -1309,8 +1435,9 @@ export const makePlugin = (site) => async ({ client }) => {
       signIn: e?.expired ? "expired" : undefined,
     })
 
-  // ask is the answer to a chat completion on the live account cred.
-  const ask = async (chat, cred, init) => {
+  // ask is the answer to a chat completion on the live account cred, in
+  // the session named (the chat.headers hook's, "" when none).
+  const ask = async (chat, cred, init, named = "") => {
     // magpie's gateway hands the model back on with the provider's prefix;
     // the catalog keys are bare
     const want = String(chat.model ?? "").replace(new RegExp(`^${ID}/`), "")
@@ -1324,7 +1451,8 @@ export const makePlugin = (site) => async ({ client }) => {
     }
     if (!m) return errorResponse({ status: 400, message: `unknown or disabled model "${chat.model}"` })
     const CHAT_URL = siteOf(site, cred).api + CHAT_PATH
-    const wire = encodeBody(JSON.stringify(qoderBody(chat, m, site)))
+    const task = taskOf(sessionOf(chat, named), chat)
+    const wire = encodeBody(JSON.stringify(qoderBody(chat, m, site, named, task)))
     const headers = {
       ...cosyHeaders(CHAT_URL, cred, wire, site),
       Accept: "text/event-stream",
@@ -1339,10 +1467,19 @@ export const makePlugin = (site) => async ({ client }) => {
       return errorResponse({ status: 502, message: e.message })
     }
     if (!res.ok) return errorResponse(failure(res.status, (await res.text()).slice(0, 1 << 20)))
-    return answer(res, chat)
+    return answer(res, chat, () => { task.answered = true })
   }
 
   return {
+    // the session the request is part of, for session_id and its task
+    // (#330): magpie names it here (the agents' own session headers), as
+    // OpenCode does, and the loader's fetch reads it back. Every plugin's
+    // hook sees every provider's requests, so it is put on this site's alone.
+    async "chat.headers"(input, output) {
+      if (input?.model?.providerID !== ID && input?.provider?.info?.id !== ID) return
+      const s = namedSession(input)
+      if (s) output.headers[SESSION] = s
+    },
     auth: {
       provider: ID,
       // magpie renews the chat token RENEW_LEAD before its end, once for
@@ -1381,6 +1518,7 @@ export const makePlugin = (site) => async ({ client }) => {
           // every chat completion written as Qoder's own request
           async fetch(input, init = {}) {
             const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url
+            const named = String((init.headers instanceof Headers ? init.headers.get(SESSION) : init.headers?.[SESSION]) ?? "")
             if (!/\/chat\/completions$/.test(new URL(url).pathname))
               return errorResponse({ status: 404, message: "only chat completions are served" })
             let chat
@@ -1395,7 +1533,7 @@ export const makePlugin = (site) => async ({ client }) => {
             } catch (e) {
               return signedInError(e)
             }
-            return signed(await ask(chat, cred, init), renewed(cred))
+            return signed(await ask(chat, cred, init, named), renewed(cred))
           },
         }
       },
@@ -1474,4 +1612,4 @@ export const QoderAuthPlugin = makePlugin(SITES.qoder)
 export const QoderCNAuthPlugin = makePlugin(SITES["qoder-cn"])
 
 // for tests
-export const _internal = { vpcInstance, vpcSite, parseUsage, gfmt, when, failure, modelInfo, qoderBody, SITES, decodeBody, events }
+export const _internal = { vpcInstance, vpcSite, parseUsage, gfmt, when, failure, modelInfo, qoderBody, SITES, decodeBody, events, cacheMarked, sessionOf, taskOf, namedSession, SESSION }

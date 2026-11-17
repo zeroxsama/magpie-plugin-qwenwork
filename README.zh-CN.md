@@ -57,6 +57,11 @@ Qoder 客户端说的是同一种请求：
   `<tool_call>` 文本里提取 —— 绝不会以标记形式混进回答。
 - 宿主的 system 消息置于一段简短的 QwenWork 前导之下原样保留；reasoning、
   usage 与积分按客户端的展示方式映射回来。
+- **提示词缓存按客户端的协议下发**（移植自 magpie-community/plugins #290/#330）：
+  最后一个用户消息的末块标 `cache_control: ephemeral`，用户轮同时带 `contents`
+  副本；同一会话每轮用同一个 `session_id`，一次用户提问的整条工具循环共享一个
+  `request_set_id` / `business` 记录。网关按会话与任务保留提示词缓存，命中数以
+  `usage.prompt_tokens_details.cached_tokens` 返回。
 
 以下配置取自千问办公桌面端自身的打包文件：
 
@@ -90,6 +95,23 @@ magpie 会在 provider 旁边显示账号的积分。数据取自登录时已经
 ```text
 qwenwork · Your Plan · until Nov 1 · you@example.com  subscription  Credits 1% (17.94 / 2000 credits)
 ```
+
+个人账号的 `quota` 只有 `remaining`，此时余额后面会附上各积分池
+（`/api/v1/adapter/user/wallets` 的 daily / monthly / long-term），与千问办公
+客户端自己的读法一致；两次读取之间池子的减少量就是这段时间实际花掉的积分。
+
+### 每次请求的 token、缓存命中与费用
+
+- **输入/输出 token 与缓存命中**来自网关在 finish 之后单独下发的 usage chunk，
+  流式与非流式都会带回。想确认网关到底发了什么，设
+  `QWENWORK_DEBUG_SSE=/path/to/capture.log` 把原始 SSE 逐字节落盘，或设
+  `QWENWORK_DEBUG_USAGE=1` 在 stderr 打印每轮的 `in / out / cached (%)` 与
+  两次用量读取之间花掉的积分。
+- **费用**：千问办公按积分计费（模型列表里的 `price_factor` 倍率，见模型旁的
+  `rate`），网关不按请求返回金额，所以 magpie 的美元成本对这类订阅模型默认按
+  $0 计。想让 magpie 显示估算成本，可以给模型设一个自己的牌价：
+  `magpie model price qwenwork/<model>`（语法见 `magpie model price --help`）；
+  真实花费以积分池的减少量为准。
 
 ## 说明
 

@@ -56,6 +56,8 @@ try {
     plan: { name: 'Fixture Plan', next_due_date: '2026-11-01T00:00:00Z', next_refresh_date: null },
     quota: { total: null, used: null, remaining: 1982.1652, exceeded: false },
   } }
+  // the wallets the mock answers with; an exhausted account has empty pools
+  let walletCtx = { data: { daily_credits: { total_balance: 100 }, monthly_credits: { total_balance: 1500.5 }, longterm_credits: { total_balance: 381.6652 } } }
   // how the mock's agent_chat answers: a list of SSE bodies, one per call
   const agentReplies = []
   const sse = (delta, finish = null) => `data: ${JSON.stringify({ statusCodeValue: 200, body: JSON.stringify({ choices: [{ delta, finish_reason: finish }] }) })}\n\n`
@@ -70,6 +72,8 @@ try {
           return Response.json({ token: 'fake-device', refresh_token: 'fake-device-refresh', user_id: 'fixture-user', expires_in: 3600 })
         case '/api/v1/adapter/user/account-context':
           return Response.json(accountCtx)
+        case '/api/v1/adapter/user/wallets':
+          return Response.json(walletCtx)
         case '/api/v1/deviceToken/refresh':
           assert.equal(body.target, 'c')
           if (rejectRefresh) return Response.json({ error: 'expired' }, { status: 401 })
@@ -122,7 +126,7 @@ try {
   assert.equal(usage.signIn, 'kept')
   assert.equal(usage.plan, 'Fixture Plan')
   assert.equal(usage.until, '2026-11-01T00:00:00.000Z')
-  assert.deepEqual(usage.windows, [{ name: 'Credits', balance: 1982.1652, display: '1982.17 credits left', unit: 'credits' }])
+  assert.deepEqual(usage.windows, [{ name: 'Credits', balance: 1982.1652, display: '1982.17 credits left (daily 100 · monthly 1500.5 · long-term 381.67)', unit: 'credits' }])
   const usageGone = await plugin.auth.usage(async () => ({ ...auth, expires: Date.now() - 1 }))
   assert.equal(usageGone.signIn, 'expired')
   checks.push('Usage reports the remaining credits and plan')
@@ -135,6 +139,7 @@ try {
 
   // An exhausted plan (remaining 0, exceeded true) is still a real reading.
   accountCtx = { data: { plan: { name: 'Pro' }, quota: { total: null, used: null, remaining: 0, exceeded: true } } }
+  walletCtx = { data: { daily_credits: { total_balance: 0 }, monthly_credits: { total_balance: 0 }, longterm_credits: { total_balance: 0 } } }
   const exhausted = await plugin.auth.usage(async () => auth)
   assert.deepEqual(exhausted.windows, [{ name: 'Credits', balance: 0, display: '0 credits left', unit: 'credits' }])
   checks.push('Usage reports an exhausted plan as zero remaining')
@@ -152,6 +157,7 @@ try {
     plan: { name: 'Fixture Plan', next_due_date: '2026-11-01T00:00:00Z', next_refresh_date: null },
     quota: { total: null, used: null, remaining: 1982.1652, exceeded: false },
   } }
+  walletCtx = { data: { daily_credits: { total_balance: 100 }, monthly_credits: { total_balance: 1500.5 }, longterm_credits: { total_balance: 381.6652 } } }
 
   const loader = await plugin.auth.loader(async () => auth)
   const chat = (over = {}) => ({ model: 'fixture-model', messages: [{ role: 'user', content: 'fixture prompt' }], ...over })
@@ -208,6 +214,50 @@ try {
   assert.equal(withResult.status, 200)
   assert.ok(agentChats[3].messages.some(m => m.role === 'tool' && m.tool_call_id === 'call_fixture' && m.content === 'the result'))
   checks.push('Tool results ride back as tool messages')
+
+  // The prompt-cache protocol (#290/#330): the last user block is marked
+  // ephemeral, user turns carry contents, and one conversation keeps one
+  // session_id; the tool loop's calls share one request_set_id/business.
+  const marked = agentChats[0].messages.at(-1)
+  assert.deepEqual(marked.content.at(-1).cache_control, { type: 'ephemeral' })
+  assert.ok(Array.isArray(marked.contents), 'user turns carry their blocks as contents too')
+  assert.equal(agentChats[2].session_id, agentChats[3].session_id, 'one session per conversation')
+  assert.equal(agentChats[2].request_set_id, agentChats[3].request_set_id, 'the tool loop is one task')
+  assert.equal(agentChats[2].business.id, agentChats[2].request_set_id)
+  assert.equal(agentChats[3].business.stage, 'processing', 'a call after an answer is processing')
+  assert.notEqual(agentChats[2].request_id, agentChats[3].request_id, 'each call has its own request id')
+  const toolTurn = agentChats[3].messages.at(-1)
+  assert.equal(toolTurn.role, 'tool')
+  assert.ok(!JSON.stringify(toolTurn).includes('cache_control'), 'nothing marked when the last turn is a tool\'s')
+  checks.push('Prompt-cache marking, stable session and one task per tool loop ride along')
+
+  // The chat.headers hook names the session magpie gives, and the loader's
+  // fetch reads it back: two prompts of one named session keep its id.
+  const headersOut = { headers: {} }
+  await plugin['chat.headers']({ model: { providerID: 'qwenwork' }, sessionID: 'ses_fixture_123' }, headersOut)
+  const sessionHeader = headersOut.headers['x-magpie-qwenwork-session']
+  assert.equal(sessionHeader, 'ses_fixture_123')
+  const other = { headers: {} }
+  await plugin['chat.headers']({ model: { providerID: 'not-qwenwork' }, sessionID: 'ses_fixture_123' }, other)
+  assert.deepEqual(other.headers, {}, 'another provider\'s request is untouched')
+  agentReplies.push([sse({ role: 'assistant', content: 'a' }), sse({}, 'stop'), 'data: {"body":"[DONE]"}\n\n'].join(''))
+  await loader.fetch(values.API + '/chat/completions', { headers: { 'x-magpie-qwenwork-session': sessionHeader }, body: JSON.stringify(chat({ messages: [{ role: 'user', content: 'first prompt of the named session' }] })) })
+  agentReplies.push([sse({ role: 'assistant', content: 'b' }), sse({}, 'stop'), 'data: {"body":"[DONE]"}\n\n'].join(''))
+  await loader.fetch(values.API + '/chat/completions', { headers: { 'x-magpie-qwenwork-session': sessionHeader }, body: JSON.stringify(chat({ messages: [{ role: 'user', content: 'second prompt of the named session' }] })) })
+  assert.equal(agentChats[4].session_id, agentChats[5].session_id, 'the named session holds across prompts')
+  assert.notEqual(agentChats[4].request_set_id, agentChats[5].request_set_id, 'a new prompt is a new task')
+  checks.push('The named session holds across prompts; each prompt is its own task')
+
+  // The usage chunk after the finish is read: tokens and the cache hit
+  // reach the caller in both the JSON completion and the stream.
+  const usageChunk = 'data: ' + JSON.stringify({ statusCodeValue: 200, body: JSON.stringify({ choices: [], usage: { prompt_tokens: 1000, completion_tokens: 50, prompt_tokens_details: { cached_tokens: 800 } } }) }) + '\n\n'
+  agentReplies.push([sse({ role: 'assistant', content: 'counted' }), sse({}, 'stop'), usageChunk, 'data: {"body":"[DONE]"}\n\n'].join(''))
+  const counted = await (await loader.fetch(values.API + '/chat/completions', { body: JSON.stringify(chat()) })).json()
+  assert.deepEqual(counted.usage, { prompt_tokens: 1000, completion_tokens: 50, total_tokens: 1050, prompt_tokens_details: { cached_tokens: 800 } })
+  agentReplies.push([sse({ role: 'assistant', content: 'counted' }), sse({}, 'stop'), usageChunk, 'data: {"body":"[DONE]"}\n\n'].join(''))
+  const countedStream = await (await loader.fetch(values.API + '/chat/completions', { body: JSON.stringify(chat({ stream: true })) })).text()
+  assert.match(countedStream, /"cached_tokens":800/, 'the stream carries the usage and cache hit')
+  checks.push('The trailing usage chunk gives tokens and cache hit in both reply shapes')
   // Streaming keeps the SSE shape magpie's client expects.
   const streamed = await loader.fetch(values.API + '/chat/completions', { body: JSON.stringify(chat({ stream: true })) })
   assert.equal(streamed.status, 200)

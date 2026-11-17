@@ -48,6 +48,32 @@ const shape = (v, depth = 0) => {
   return Object.keys(v).map(k => `${k}:${shape(v[k], depth + 1)}`).join(', ') || '(empty)'
 }
 
+// walletPools names each credit pool's balance from /api/v1/adapter/user/
+// wallets, as QwenWork's own client reads them (QwenWorkCN.app's
+// fetchUserWallets / mergeWalletsIntoCreditBreakdown): daily_credits,
+// monthly_credits, longterm_credits, each a total_balance. A personal
+// account's quota gives only the remaining sum; the pools say where it
+// sits, and their drop between two reads is what a run spent.
+const walletPools = (w) => {
+  const d = w?.data && typeof w.data === 'object' ? w.data : (w ?? {})
+  const out = []
+  for (const [key, name] of [['daily_credits', 'daily'], ['monthly_credits', 'monthly'], ['longterm_credits', 'long-term']]) {
+    const b = Number(d?.[key]?.total_balance ?? d?.[key]?.totalBalance)
+    if (Number.isFinite(b) && b > 0) out.push(`${name} ${num(b)}`)
+  }
+  return out
+}
+
+// spentSince logs the credits gone since the last usage read on stderr
+// when QWENWORK_DEBUG_USAGE=1: the real per-run cost the gateway bills,
+// which no per-request usage chunk carries.
+let lastRemaining
+function spentSince(left) {
+  if (process.env.QWENWORK_DEBUG_USAGE !== '1' || left === undefined) return
+  if (lastRemaining !== undefined && left < lastRemaining) console.error(`[qwenwork] credits spent since last read: ${num(lastRemaining - left)} (${num(lastRemaining)} -> ${num(left)})`)
+  lastRemaining = left
+}
+
 // qwenworkUsage reads the account's credits for magpie's usage bar from the
 // account-context the sign-in already uses. QwenWork's real response gives
 // quota {total: null, used: null, remaining, exceeded} — only the remaining
@@ -84,8 +110,21 @@ function qwenworkUsage(openapi) {
         if (Number.isFinite(spent) && spent >= 0) out.windows = [{ name: 'Credits', used: Math.min(100, (100 * spent) / total), display: `${num(spent)} / ${num(total)} credits` }]
       }
       if (!out.windows && left !== undefined && left >= 0) {
-        out.windows = [{ name: 'Credits', balance: left, display: `${num(left)} credits left`, unit: 'credits' }]
+        // the pools behind the balance, as the client asks for a personal
+        // account's; a failed read leaves the balance without them
+        let pools = []
+        if (ctx.user?.is_biz !== true && ctx.user?.isBiz !== true) {
+          try {
+            const wres = await fetch(`${openapi}/api/v1/adapter/user/wallets`, {
+              headers: { Accept: 'application/json', Authorization: `Bearer ${a.access}` },
+              signal: AbortSignal.timeout(20_000),
+            })
+            if (wres.ok) pools = walletPools(await wres.json())
+          } catch {}
+        }
+        out.windows = [{ name: 'Credits', balance: left, display: `${num(left)} credits left${pools.length ? ` (${pools.join(' · ')})` : ''}`, unit: 'credits' }]
       }
+      spentSince(left)
       if (!out.windows) out.error = `QwenWork: the account reports no credits (quota: ${shape(q)})`
       return out
     } catch (e) {
